@@ -2,7 +2,8 @@
 
 import logging
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 import cv2
@@ -38,6 +39,7 @@ class PipelineOutput:
     """Pipeline output container."""
 
     images: List[Image.Image]
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 class TryOnPipeline:
@@ -156,10 +158,17 @@ class TryOnPipeline:
         guidance_scale: float = 1.5,
         skip_cfg_last_n_steps: int = 1,
         use_tqdm: bool = True,
-    ) -> List[Image.Image]:
+    ) -> tuple[List[Image.Image], Optional[float]]:
         """Euler sampling with CFG."""
         device, dtype = ca_images.device, ca_images.dtype
         batch_size = ca_images.shape[0]
+
+        gpu_start = gpu_end = None
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            gpu_start = torch.cuda.Event(enable_timing=True)
+            gpu_end = torch.cuda.Event(enable_timing=True)
+            gpu_start.record()
 
         # Init noisy images
         c, h, w = self.tryon_model.channels_in, *self.tryon_model.input_shape
@@ -200,7 +209,14 @@ class TryOnPipeline:
             images = images + dt * v_guided
 
         images = images.to(dtype=torch.float).clamp_(-1.0, 1.0)
-        return [tensor_to_pil(img, unnormalize=True) for img in images]
+
+        sampling_gpu_seconds = None
+        if gpu_start is not None and gpu_end is not None:
+            gpu_end.record()
+            torch.cuda.synchronize(device)
+            sampling_gpu_seconds = gpu_start.elapsed_time(gpu_end) / 1000
+
+        return [tensor_to_pil(img, unnormalize=True) for img in images], sampling_gpu_seconds
 
     @torch.inference_mode()
     def __call__(
@@ -238,6 +254,9 @@ class TryOnPipeline:
         Returns:
             PipelineOutput with `images` list containing generated PIL Images.
         """
+        pipeline_started_at = time.perf_counter()
+        timings: dict[str, float] = {}
+
         # Set seed
         torch.manual_seed(seed)
         if self.device.type == "cuda":
@@ -245,13 +264,16 @@ class TryOnPipeline:
         np.random.seed(seed)
 
         # Pre-resize for pose detection quality
+        phase_started_at = time.perf_counter()
         person_image = self.pre_resize(person_image, allow_upsampling=False)
         garment_image = self.pre_resize(garment_image, allow_upsampling=False)
 
         person_image_np = np.array(person_image)
         garment_image_np = np.array(garment_image)
+        timings["input_preprocessing_seconds"] = time.perf_counter() - phase_started_at
 
         # Pose detection (DWPose expects BGR)
+        phase_started_at = time.perf_counter()
         person_pose = self.pose_model(person_image_np[..., ::-1])
         garment_pose = (
             get_dummy_dw_keypoints()
@@ -261,12 +283,16 @@ class TryOnPipeline:
 
         person_pose_img = draw_pose(person_pose, person_image_np.shape[0], person_image_np.shape[1], grayscale=True)
         garment_pose_img = draw_pose(garment_pose, garment_image_np.shape[0], garment_image_np.shape[1], grayscale=True)
+        timings["pose_detection_seconds"] = time.perf_counter() - phase_started_at
 
         # Human parsing
+        phase_started_at = time.perf_counter()
         person_seg_pred = self.hp_model.predict(person_image_np)
         garment_seg_pred = self.hp_model.predict(garment_image_np)
+        timings["human_parsing_seconds"] = time.perf_counter() - phase_started_at
 
         # Get labels to segment based on category
+        phase_started_at = time.perf_counter()
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
         labels_to_segment = BODY_COVERAGE_TO_FASHN_LABELS.get(body_coverage)
         labels_to_segment_indices = [FASHN_LABELS_TO_IDS[label] for label in labels_to_segment]
@@ -315,10 +341,14 @@ class TryOnPipeline:
         garment_tensor = garment_tensor.to(dtype=self.inference_dtype)
         person_pose_tensor = person_pose_tensor.to(dtype=self.inference_dtype)
         garment_pose_tensor = garment_pose_tensor.to(dtype=self.inference_dtype)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        timings["conditioning_seconds"] = time.perf_counter() - phase_started_at
 
         # Run sampling
         self.logger.info(f"Running inference with {num_timesteps} timesteps...")
-        images = self._sample(
+        phase_started_at = time.perf_counter()
+        images, sampling_gpu_seconds = self._sample(
             ca_images=ca_tensor,
             garment_images=garment_tensor,
             person_poses=person_pose_tensor,
@@ -328,10 +358,16 @@ class TryOnPipeline:
             guidance_scale=guidance_scale,
             skip_cfg_last_n_steps=skip_cfg_last_n_steps,
         )
+        timings["sampling_wall_seconds"] = time.perf_counter() - phase_started_at
+        if sampling_gpu_seconds is not None:
+            timings["sampling_gpu_seconds"] = sampling_gpu_seconds
 
         # Unpad outputs
+        phase_started_at = time.perf_counter()
         images = [self.resize_pad_fn.unpad(img) for img in images]
+        timings["output_postprocessing_seconds"] = time.perf_counter() - phase_started_at
+        timings["pipeline_total_seconds"] = time.perf_counter() - pipeline_started_at
 
         self.logger.info(f"Generated {len(images)} images")
 
-        return PipelineOutput(images=images)
+        return PipelineOutput(images=images, timings=timings)
